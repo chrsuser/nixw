@@ -1,0 +1,355 @@
+#!/bin/sh
+#
+# nixw - a gradlew-style wrapper for Nix (flakes + nix-command)
+#
+# Copyright (c) 2026 chrsuser
+# SPDX-License-Identifier: MIT
+#
+# Usage: ./nixw <nix arguments...>      e.g.  ./nixw build   ./nixw develop
+#
+# `./nixw ARGS` behaves exactly like `nix ARGS`:
+#
+#   * If Nix is installed (on PATH, or at a well-known location), it is used
+#     as-is after checking that the `nix-command` and `flakes` features are
+#     enabled. If they are not, nixw explains how to enable them and exits.
+#
+#   * Otherwise (Linux only) nixw installs a private, pinned copy of Nix into
+#     ~/.nix without root, using a static nix-user-chroot binary to mount
+#     ~/.nix at /nix inside an unprivileged user namespace, and runs it there.
+#     Nothing outside ~/.nix is touched (apart from Nix's usual ~/.cache/nix).
+#     To remove it all: chmod -R u+w ~/.nix && rm -rf ~/.nix
+#
+# Environment variables:
+#
+#   NIXW_NIX_DIR=DIR          where the private Nix lives (default: ~/.nix)
+#   NIXW_USE_SYSTEM_NIX=0     ignore any installed Nix; use the private one
+#   NIXW_SKIP_CHECK=1         don't check the installed Nix's feature flags
+#   NIXW_VERBOSE=1            print what nixw is doing
+#   NIXW_NIX_VERSION=X.Y.Z    override the pinned Nix version (set
+#   NIXW_NIX_INSTALLER_SHA256   the installer's sha256 too, or it isn't checked)
+#   NIXW_NIX_INSTALLER_URL    override the Nix installer URL (e.g. a mirror)
+#   NIXW_CHROOT_URL           override the nix-user-chroot download URL
+#   NIXW_CHROOT_SHA256        override the nix-user-chroot sha256
+#
+# https://github.com/nix-community/nix-user-chroot
+# https://nix.dev/manual/nix/stable/installation/
+
+# ---------------------------------------------------------------------------
+# Pinned versions. Project maintainers: edit these to upgrade.
+# ---------------------------------------------------------------------------
+
+nixw_nix_version=2.35.4
+nixw_nix_installer_sha256=118c3dfa04bdc946b3f577365b9a295607142c9b920e2c07b184e266d62b1ee1
+
+nixw_chroot_version=2.1.1
+nixw_chroot_sha256_x86_64=e6daa6a036e00b939531e5c11e6dcd891140813a09964fd12a64112de500fc15
+nixw_chroot_sha256_aarch64=9aeaa70f4fb645afb343b0417e494b0271457a8cb465c4ac82b6c3b19040d397
+nixw_chroot_sha256_i686=02a99327cff3a4fa65f71303b15a47be1d772b5551031ece27ad8236e89f0034
+
+# ---------------------------------------------------------------------------
+
+set -u
+
+say() { printf 'nixw: %s\n' "$*" >&2; }
+debug() { if [ "${NIXW_VERBOSE:-0}" = 1 ]; then say "$@"; fi; }
+die() { say "error: $*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Using an existing Nix
+# ---------------------------------------------------------------------------
+
+find_system_nix() {
+    if [ "${NIXW_USE_SYSTEM_NIX:-1}" = 0 ]; then
+        return 1
+    fi
+    if system_nix=$(command -v nix 2>/dev/null) && [ -n "$system_nix" ]; then
+        return 0
+    fi
+    # Installed but not on PATH (e.g. the profile script wasn't sourced).
+    for system_nix in \
+        /nix/var/nix/profiles/default/bin/nix \
+        /run/current-system/sw/bin/nix \
+        "${HOME:-/nonexistent}/.nix-profile/bin/nix"; do
+        if [ -x "$system_nix" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Probe with a flake command on a path that can't exist: this fails fast
+# without touching the network, with a distinct error per missing feature.
+# Unlike reading `experimental-features`, it is also correct for Nix
+# distributions where flakes are no longer experimental.
+check_system_nix() {
+    if [ "${NIXW_SKIP_CHECK:-0}" = 1 ]; then
+        return 0
+    fi
+    probe=$("$system_nix" flake metadata /nixw-feature-probe/nonexistent 2>&1)
+    case $probe in
+        *"feature 'nix-command'"* | *"feature 'flakes'"*) ;;
+        *"not a recognised command"* | *"unrecognised flag"* | *"unrecognized"*)
+            die "$system_nix is too old for flakes (Nix >= 2.4 is required); \
+upgrade it, or run with NIXW_USE_SYSTEM_NIX=0 to use a private Nix instead"
+            ;;
+        *) return 0 ;;
+    esac
+
+    cat >&2 <<EOF
+nixw: found Nix at $system_nix, but the 'nix-command' and/or 'flakes'
+nixw: experimental features are not enabled, and this project needs both.
+
+To enable them for your user, add this line to ${XDG_CONFIG_HOME:-~/.config}/nix/nix.conf:
+
+    experimental-features = nix-command flakes
+
+(or to /etc/nix/nix.conf for all users, then restart nix-daemon if you use it).
+
+To enable them for a single run instead:
+
+    NIX_CONFIG='extra-experimental-features = nix-command flakes' $0 ${1:-<command>} ...
+EOF
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Private Nix via nix-user-chroot
+# ---------------------------------------------------------------------------
+
+sha256_of() {
+    if have sha256sum; then
+        sha256sum -b "$1" | cut -c1-64
+    elif have shasum; then
+        shasum -a 256 -b "$1" | cut -c1-64
+    elif have openssl; then
+        openssl dgst -r -sha256 "$1" | cut -c1-64
+    else
+        die "need one of sha256sum, shasum or openssl to verify downloads"
+    fi
+}
+
+download() { # URL DEST
+    debug "downloading $1"
+    if have curl; then
+        curl --fail --location --silent --show-error --retry 3 -o "$2" "$1"
+    elif have wget; then
+        wget -q -O "$2" "$1"
+    else
+        die "need curl or wget to download Nix"
+    fi
+}
+
+# download_verified URL DEST SHA256 (empty SHA256 = don't verify)
+download_verified() {
+    rm -f "$2.part"
+    download "$1" "$2.part" || die "failed to download $1"
+    if [ -n "$3" ]; then
+        actual=$(sha256_of "$2.part")
+        if [ "$actual" != "$3" ]; then
+            rm -f "$2.part"
+            die "sha256 mismatch for $1: expected $3, got $actual"
+        fi
+    else
+        say "warning: no sha256 configured for $1; not verifying it"
+    fi
+    mv -f "$2.part" "$2" || die "cannot write $2"
+}
+
+acquire_lock() {
+    lock_dir=$state_dir/lock
+    waited=0
+    until mkdir "$lock_dir" 2>/dev/null; do
+        pid=$(cat "$lock_dir/pid" 2>/dev/null) || pid=
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            debug "removing stale lock held by dead process $pid"
+            rm -rf "$lock_dir"
+            continue
+        fi
+        if [ "$waited" = 0 ]; then
+            say "waiting for another nixw to finish installing Nix..."
+        fi
+        waited=$((waited + 1))
+        if [ "$waited" -gt 1800 ]; then
+            die "timed out waiting for $lock_dir; remove it if no nixw is running"
+        fi
+        sleep 1
+    done
+    echo "$$" >"$lock_dir/pid"
+    trap 'rm -rf "$lock_dir"' EXIT
+    trap 'rm -rf "$lock_dir"; exit 130' INT
+    trap 'rm -rf "$lock_dir"; exit 143' TERM
+}
+
+release_lock() {
+    rm -rf "$lock_dir"
+    trap - EXIT INT TERM
+}
+
+userns_diagnostics() {
+    say "nix-user-chroot could not create an unprivileged user namespace on this machine."
+    if [ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null)" = 0 ]; then
+        say "unprivileged user namespaces are disabled; an admin can enable them with:"
+        say "    sudo sysctl -w kernel.unprivileged_userns_clone=1"
+    fi
+    if [ "$(cat /proc/sys/user/max_user_namespaces 2>/dev/null)" = 0 ]; then
+        say "user namespaces are disabled (user.max_user_namespaces = 0); an admin can enable them with:"
+        say "    sudo sysctl -w user.max_user_namespaces=10000"
+    fi
+    if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = 1 ]; then
+        cat >&2 <<EOF
+nixw: AppArmor restricts unprivileged user namespaces here (e.g. Ubuntu >= 23.10).
+nixw: An admin can allow nix-user-chroot by creating /etc/apparmor.d/nixw with:
+
+abi <abi/4.0>,
+include <tunables/global>
+profile nixw-nix-user-chroot $chroot_bin flags=(unconfined) {
+  userns,
+}
+
+nixw: and then running:  sudo apparmor_parser -r /etc/apparmor.d/nixw
+EOF
+    fi
+    say "inside a container, user namespaces are often blocked by seccomp; there"
+    say "it is usually easier to install Nix normally: https://nixos.org/download"
+    exit 1
+}
+
+ensure_chroot() {
+    if [ -x "$chroot_bin" ]; then
+        return 0
+    fi
+    say "downloading nix-user-chroot $nixw_chroot_version ($arch)"
+    download_verified "$chroot_url" "$chroot_bin" "$chroot_sha256"
+    chmod 0755 "$chroot_bin" || die "cannot chmod $chroot_bin"
+    if ! smoke=$("$chroot_bin" "$nix_dir" /bin/sh -c 'test -d /nix/var/nixw' 2>&1); then
+        printf '%s\n' "$smoke" | sed 's/^/nixw: | /' >&2
+        rm -f "$chroot_bin"
+        userns_diagnostics
+    fi
+}
+
+install_nix() {
+    for tool in tar xz; do
+        have "$tool" || die "the Nix installer needs '$tool'; please install it first"
+    done
+
+    installer=$state_dir/install-nix-$nix_version
+    say "installing Nix $nix_version into $nix_dir (this only happens once)"
+    download_verified "$installer_url" "$installer" "$installer_sha256"
+
+    # Private config. nix-user-chroot sets NIX_CONF_DIR=/nix/etc/nix.
+    if [ ! -e "$nix_dir/etc/nix/nix.conf" ]; then
+        mkdir -p "$nix_dir/etc/nix" || die "cannot create $nix_dir/etc/nix"
+        cat >"$nix_dir/etc/nix/nix.conf" <<EOF || die "cannot write $nix_dir/etc/nix/nix.conf"
+# Written by nixw. This file is only used by the private Nix in $nix_dir.
+experimental-features = nix-command flakes
+build-users-group =
+EOF
+    fi
+
+    # Run the official installer with a scratch HOME whose ~/.nix-profile
+    # points at a per-version profile under /nix/var/nix/profiles (which
+    # makes it a GC root). That keeps the real HOME untouched and lets
+    # several pinned Nix versions coexist, like gradle distributions.
+    install_home=$state_dir/install-home
+    rm -rf "$install_home"
+    mkdir -p "$install_home" "$nix_dir/var/nix/profiles/nixw" || die "cannot create $nix_dir/var"
+    ln -s "$nix_profile" "$install_home/.nix-profile" || die "cannot create $install_home/.nix-profile"
+
+    # The installer's output is mostly advice about shell profiles that
+    # doesn't apply here, so keep it in a log and only show it on failure.
+    install_log=$state_dir/install.log
+    say "running the Nix installer (this can take a minute)..."
+    # shellcheck disable=SC2030,SC2031 # HOME is only changed in the subshell
+    if ! (
+        unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME \
+            NIX_CONFIG NIX_PATH NIX_SSL_CERT_FILE NIX_REMOTE
+        HOME=/nix/var/nixw/install-home
+        export HOME
+        exec "$chroot_bin" "$nix_dir" /bin/sh "/nix/var/nixw/install-nix-$nix_version" \
+            --no-daemon --no-channel-add --no-modify-profile
+    ) </dev/null >"$install_log" 2>&1; then
+        sed 's/^/nixw: | /' "$install_log" >&2
+        die "the Nix installer failed (full log: $install_log)"
+    fi
+
+    rm -rf "$install_home" "$installer" "$install_log"
+    : >"$installed_stamp" || die "cannot write $installed_stamp"
+    say "Nix $nix_version installed"
+}
+
+run_private_nix() {
+    if [ "$(uname -s)" != Linux ]; then
+        die "Nix is not installed. On $(uname -s), nixw cannot install a private
+copy for you; please install Nix first: https://nixos.org/download"
+    fi
+    case $(uname -m) in
+        x86_64 | amd64) arch=x86_64 chroot_sha256=$nixw_chroot_sha256_x86_64 ;;
+        aarch64 | arm64) arch=aarch64 chroot_sha256=$nixw_chroot_sha256_aarch64 ;;
+        i?86) arch=i686 chroot_sha256=$nixw_chroot_sha256_i686 ;;
+        *) die "Nix is not installed, and nix-user-chroot has no build for $(uname -m);
+please install Nix first: https://nixos.org/download" ;;
+    esac
+
+    nix_version=${NIXW_NIX_VERSION:-$nixw_nix_version}
+    if [ "$nix_version" = "$nixw_nix_version" ]; then
+        installer_sha256=${NIXW_NIX_INSTALLER_SHA256:-$nixw_nix_installer_sha256}
+    else
+        installer_sha256=${NIXW_NIX_INSTALLER_SHA256:-}
+    fi
+    installer_url=${NIXW_NIX_INSTALLER_URL:-https://releases.nixos.org/nix/nix-$nix_version/install}
+    chroot_url=${NIXW_CHROOT_URL:-https://github.com/nix-community/nix-user-chroot/releases/download/$nixw_chroot_version/nix-user-chroot-bin-$nixw_chroot_version-$arch-unknown-linux-musl}
+    chroot_sha256=${NIXW_CHROOT_SHA256:-$chroot_sha256}
+
+    # shellcheck disable=SC2031 # install_nix's HOME change is in a subshell
+    if [ -n "${NIXW_NIX_DIR:-}" ]; then
+        nix_dir=$NIXW_NIX_DIR
+    elif [ -n "${HOME:-}" ]; then
+        nix_dir=$HOME/.nix
+    else
+        die "HOME is not set; set NIXW_NIX_DIR to choose where to install Nix"
+    fi
+    state_dir=$nix_dir/var/nixw
+    chroot_bin=$state_dir/nix-user-chroot-$nixw_chroot_version
+    nix_profile=/nix/var/nix/profiles/nixw/nix-$nix_version # path inside the chroot
+    installed_stamp=$state_dir/nix-$nix_version.installed
+
+    if [ ! -x "$chroot_bin" ] || [ ! -e "$installed_stamp" ]; then
+        # (tolerating a concurrent nixw creating it first)
+        mkdir -m 0755 "$nix_dir" 2>/dev/null || [ -d "$nix_dir" ] || die "cannot create $nix_dir"
+        mkdir -p "$state_dir" || die "cannot create $state_dir"
+        acquire_lock
+        ensure_chroot
+        if [ ! -e "$installed_stamp" ]; then
+            install_nix
+        fi
+        release_lock
+    fi
+
+    # These are only meaningful inside the chroot, where $nix_dir is /nix.
+    PATH=$nix_profile/bin:$PATH
+    if [ -z "${NIX_SSL_CERT_FILE:-}" ]; then
+        NIX_SSL_CERT_FILE=$nix_profile/etc/ssl/certs/ca-bundle.crt
+        for f in /etc/ssl/certs/ca-certificates.crt /etc/ssl/ca-bundle.pem \
+            /etc/ssl/certs/ca-bundle.crt /etc/pki/tls/certs/ca-bundle.crt; do
+            if [ -e "$f" ]; then
+                NIX_SSL_CERT_FILE=$f
+                break
+            fi
+        done
+    fi
+    export PATH NIX_SSL_CERT_FILE
+
+    debug "using private Nix $nix_version in $nix_dir"
+    exec "$chroot_bin" "$nix_dir" "$nix_profile/bin/nix" "$@"
+}
+
+# ---------------------------------------------------------------------------
+
+if find_system_nix; then
+    debug "using $system_nix"
+    check_system_nix "$@"
+    exec "$system_nix" "$@"
+fi
+run_private_nix "$@"
